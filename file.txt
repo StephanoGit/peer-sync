@@ -1,23 +1,2 @@
-python3 - <<'EOF'
-import socket, time
-from zeroconf import Zeroconf, ServiceInfo
-
-my_ip = socket.gethostbyname(socket.gethostname())
-print(f"My IP: {my_ip}")
-
-info = ServiceInfo(
-    "_sharefile._tcp.local.",
-    "test-node._sharefile._tcp.local.",
-    addresses=[socket.inet_aton(my_ip)],
-    port=55100,
-    properties={b"id": b"testid", b"hostname": b"testnode"},
-)
-
-zc = Zeroconf()
-zc.register_service(info)
-print("Advertising... (wait 10 seconds, check from other machine)")
-time.sleep(10)
-zc.unregister_service(info)
-zc.close()
-print("Done")
-EOF
+chmod +x share.py
+cp share.py ~/.local/bin/share

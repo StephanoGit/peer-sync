@@ -1,658 +1,398 @@
 #!/usr/bin/env python3
 """
-share - a simple peer-to-peer file transfer CLI
+share — minimal local-network file & message sharing
+stdlib only, no external dependencies.
+
 Usage:
-  share            - interactive mode: discover peers, select file, send
-  share --listen   - run as background daemon (auto-starts on install)
-  share --pair     - pair with a new peer
-  share --peers    - list trusted peers
+  share pair --listen          Wait for a peer to connect and pair with you
+  share pair <ip>              Initiate pairing with a peer at <ip>
+  share send <file> [peer]     Send a file to a peer
+  share msg  <text> [peer]     Send a short message to a peer
+  share recv                   Wait for ONE incoming transfer, then exit
+  share peers                  List all trusted peers
+
+Design philosophy
+─────────────────
+• No daemon / background process.
+  The receiver manually runs `share recv` when they want to accept something.
+  This avoids systemd/launchd complexity and keeps the tool auditable.
+
+• Whitelist-only.
+  You must explicitly pair before any transfer is accepted.
+  Peers are stored in ~/.config/share/peers.json.
+
+• Fixed TCP port (PORT constant below).
+  mDNS/zeroconf discovery was deliberately left out to avoid dependencies.
+  You identify peers by the name you give them at pairing time; their IP is
+  remembered. If a peer's IP changes (DHCP), just re-pair.
+
+• One-shot connections.
+  Each send/recv opens a socket, does its work, and closes.
+  No keep-alive, no multiplexing — easier to reason about.
+
+• Simple wire protocol.
+  [4 bytes: big-endian length of header JSON]
+  [N bytes: UTF-8 JSON header]
+  [remaining bytes: raw file payload (empty for messages)]
+  The header carries type, sender name, filename, and file size.
 """
 
-import os
-import sys
+import argparse
 import json
+import os
 import socket
 import struct
-import hashlib
-import threading
-import time
-import signal
-import argparse
+import sys
 from pathlib import Path
 from datetime import datetime
 
-# ── deps ──────────────────────────────────────────────────────────────────────
-try:
-    from zeroconf import ServiceBrowser, ServiceInfo, Zeroconf
-    from rich.console import Console
-    from rich.table import Table
-    from rich.progress import Progress, BarColumn, TransferSpeedColumn, TimeRemainingColumn
-    from rich.prompt import Confirm
-    from rich import print as rprint
-    import questionary
-    from questionary import Style as QStyle
-except ImportError:
-    print("\n  Missing dependencies. Install with:\n")
-    print("  pip install zeroconf rich questionary\n")
-    sys.exit(1)
+# ── Configuration ─────────────────────────────────────────────────────────────
 
-# ── config ────────────────────────────────────────────────────────────────────
-APP_DIR       = Path.home() / ".share-cli"
-INBOX_DIR     = Path.home() / "ShareInbox"
-PEERS_FILE    = APP_DIR / "trusted_peers.json"
-KEYS_DIR      = APP_DIR / "keys"
-SERVICE_TYPE  = "_sharefile._tcp.local."
-TRANSFER_PORT = 55100
-PAIR_PORT     = 55101
-CHUNK_SIZE    = 65536  # 64KB
+PORT        = 57890          # arbitrary unprivileged port; change if it collides
+INBOX       = Path.home() / "ShareInbox"
+CONFIG_DIR  = Path.home() / ".config" / "share"
+PEERS_FILE  = CONFIG_DIR / "peers.json"
+CHUNK       = 65536          # bytes to read/write per loop iteration
+TIMEOUT     = 10             # socket timeout in seconds
 
-console = Console()
-
-STYLE = QStyle([
-    ("qmark",        "fg:#61afef bold"),
-    ("question",     "bold"),
-    ("answer",       "fg:#98c379 bold"),
-    ("pointer",      "fg:#61afef bold"),
-    ("highlighted",  "fg:#61afef bold"),
-    ("selected",     "fg:#98c379"),
-    ("separator",    "fg:#5c6370"),
-    ("instruction",  "fg:#5c6370"),
-    ("text",         ""),
-    ("disabled",     "fg:#5c6370 italic"),
-])
-
-# ── setup ─────────────────────────────────────────────────────────────────────
-def setup_dirs():
-    APP_DIR.mkdir(exist_ok=True)
-    KEYS_DIR.mkdir(exist_ok=True)
-    INBOX_DIR.mkdir(exist_ok=True)
-    if not PEERS_FILE.exists():
-        PEERS_FILE.write_text(json.dumps({}))
+# ── Peer store ────────────────────────────────────────────────────────────────
+# Peers are stored as { "alice": "192.168.1.42", ... }
+# We use a plain dict serialised to JSON — no database needed at this scale.
 
 def load_peers() -> dict:
-    try:
+    if PEERS_FILE.exists():
         return json.loads(PEERS_FILE.read_text())
-    except Exception:
-        return {}
+    return {}
 
 def save_peers(peers: dict):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     PEERS_FILE.write_text(json.dumps(peers, indent=2))
 
-def get_my_id() -> str:
-    id_file = APP_DIR / "my_id"
-    if id_file.exists():
-        return id_file.read_text().strip()
-    import uuid
-    my_id = str(uuid.uuid4())[:8]
-    id_file.write_text(my_id)
-    return my_id
+def pick_peer(peers: dict, hint: str | None) -> tuple[str, str]:
+    """Return (name, ip) for the chosen peer, or exit with an error."""
+    if not peers:
+        die("No trusted peers yet. Run: share pair <ip>")
 
-def get_hostname() -> str:
-    return socket.gethostname().replace(".local", "")
+    if hint:
+        if hint not in peers:
+            die(f"Unknown peer '{hint}'. Known peers: {', '.join(peers)}")
+        return hint, peers[hint]
 
-def get_local_ip() -> str:
+    if len(peers) == 1:
+        name, ip = next(iter(peers.items()))
+        return name, ip
+
+    # Multiple peers — let the user choose
+    print("Multiple peers available:")
+    names = list(peers)
+    for i, n in enumerate(names, 1):
+        print(f"  {i}) {n}  ({peers[n]})")
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
+        choice = int(input("Send to (number): ")) - 1
+        name = names[choice]
+        return name, peers[name]
+    except (ValueError, IndexError):
+        die("Invalid choice.")
 
-# ── discovery ─────────────────────────────────────────────────────────────────
-def get_zeroconf_iface() -> str | None:
-    """Return the best network interface for zeroconf (prefers en0, then first non-loopback)."""
-    import netifaces  # optional, fall back gracefully
-    pass
+# ── Wire protocol helpers ─────────────────────────────────────────────────────
 
-def make_zeroconf() -> Zeroconf:
-    """Create a Zeroconf instance bound to the correct interface."""
-    import socket
-    # Try to find a real LAN interface — prefer en0 (WiFi on macOS)
-    preferred = ["en0", "en1", "eth0", "wlan0"]
-    iface = None
-    for name in preferred:
+def send_header(sock: socket.socket, header: dict):
+    """Encode and send a length-prefixed JSON header."""
+    data = json.dumps(header).encode()
+    sock.sendall(struct.pack(">I", len(data)) + data)
+
+def recv_header(sock: socket.socket) -> dict:
+    """Read and decode a length-prefixed JSON header."""
+    raw_len = _recv_exactly(sock, 4)
+    length  = struct.unpack(">I", raw_len)[0]
+    return json.loads(_recv_exactly(sock, length))
+
+def _recv_exactly(sock: socket.socket, n: int) -> bytes:
+    """Read exactly n bytes from the socket, raising on short read."""
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("Connection closed unexpectedly")
+        buf += chunk
+    return buf
+
+def my_name() -> str:
+    """Use the machine hostname as our identity (good enough for LAN use)."""
+    return socket.gethostname()
+
+# ── Pairing ───────────────────────────────────────────────────────────────────
+# Pairing is a two-step mutual exchange:
+#   1. Both sides send their name.
+#   2. Both sides receive the other's name.
+#   3. Each side saves (name -> ip) in its peer store.
+#
+# No crypto / certificates — this is a trust-on-first-use model for a LAN.
+# If you need security, put it on a VPN or add TLS later.
+
+def cmd_pair_listen():
+    """Wait for a peer to connect, exchange names, save them."""
+    print(f"Waiting for a peer to connect on port {PORT} …  (Ctrl-C to cancel)")
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+        # SO_REUSEADDR lets us restart quickly without waiting for TIME_WAIT
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("", PORT))
+        srv.listen(1)
+        conn, (peer_ip, _) = srv.accept()
+
+    with conn:
+        conn.settimeout(TIMEOUT)
+        # Exchange names — initiator sends first, listener responds
+        peer_name_raw = _recv_exactly(conn, 256).rstrip(b"\x00").decode()
+        conn.sendall(my_name().encode().ljust(256, b"\x00"))
+
+    peers = load_peers()
+    peers[peer_name_raw] = peer_ip
+    save_peers(peers)
+    print(f"✓ Paired with '{peer_name_raw}' ({peer_ip}). They can now send you files.")
+
+def cmd_pair_connect(ip: str):
+    """Connect to a listening peer, exchange names, save them."""
+    print(f"Connecting to {ip}:{PORT} …")
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(TIMEOUT)
         try:
-            socket.if_nametoindex(name)
-            iface = name
-            break
-        except OSError:
-            continue
+            s.connect((ip, PORT))
+        except (ConnectionRefusedError, TimeoutError):
+            die(f"Could not connect to {ip}:{PORT}. Make sure the other side runs: share pair --listen")
 
-    if iface:
-        from zeroconf import InterfaceChoice
+        s.sendall(my_name().encode().ljust(256, b"\x00"))
+        peer_name_raw = _recv_exactly(s, 256).rstrip(b"\x00").decode()
+
+    peers = load_peers()
+    peers[peer_name_raw] = ip
+    save_peers(peers)
+    print(f"✓ Paired with '{peer_name_raw}' ({ip}). You can now send them files.")
+
+# ── Send ──────────────────────────────────────────────────────────────────────
+
+def cmd_send(filepath: str, peer_hint: str | None):
+    path = Path(filepath)
+    if not path.exists():
+        die(f"File not found: {filepath}")
+
+    peers = load_peers()
+    name, ip = pick_peer(peers, peer_hint)
+
+    size = path.stat().st_size
+    print(f"Sending '{path.name}' ({_fmt_size(size)}) to {name} ({ip}) …")
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(TIMEOUT)
         try:
-            # bind to the specific interface ip
-            ip = get_local_ip()
-            return Zeroconf(interfaces=[ip])
-        except Exception:
-            pass
-    return Zeroconf()
+            s.connect((ip, PORT))
+        except (ConnectionRefusedError, TimeoutError):
+            die(f"Could not reach {name} ({ip}:{PORT}). Ask them to run: share recv")
 
-class PeerDiscovery:
-    def __init__(self):
-        self.zeroconf   = make_zeroconf()
-        self.peers      = {}   # name -> {ip, port, id, hostname}
-        self._lock      = threading.Lock()
-        self._browser   = None
-        self._info      = None
+        # Send header first so the receiver knows what's coming
+        send_header(s, {
+            "type":     "file",
+            "from":     my_name(),
+            "filename": path.name,
+            "size":     size,
+        })
 
-    def start_advertising(self):
-        my_ip   = get_local_ip()
-        my_id   = get_my_id()
-        my_name = get_hostname()
-        name    = f"{my_name}-{my_id}.{SERVICE_TYPE}"
-
-        self._info = ServiceInfo(
-            SERVICE_TYPE,
-            name,
-            addresses=[socket.inet_aton(my_ip)],
-            port=TRANSFER_PORT,
-            properties={
-                b"id":       my_id.encode(),
-                b"hostname": my_name.encode(),
-            },
-        )
-        self.zeroconf.register_service(self._info)
-
-    def start_browsing(self):
-        self._browser = ServiceBrowser(self.zeroconf, SERVICE_TYPE, self)
-
-    def add_service(self, zc, type_, name):
-        info = zc.get_service_info(type_, name)
-        if not info:
-            return
-        peer_id = info.properties.get(b"id", b"").decode()
-        if peer_id == get_my_id():
-            return   # that's me
-        hostname = info.properties.get(b"hostname", b"unknown").decode()
-        ip = socket.inet_ntoa(info.addresses[0])
-        with self._lock:
-            self.peers[peer_id] = {
-                "ip":       ip,
-                "port":     info.port,
-                "id":       peer_id,
-                "hostname": hostname,
-            }
-
-    def remove_service(self, zc, type_, name):
-        # Don't call get_service_info here — the service is already gone
-        # and zeroconf may be shutting down, causing NotRunningException.
-        # The service name is formatted as "{hostname}-{id}._sharefile._tcp.local."
-        # so we extract the id from the name string directly.
-        try:
-            # name looks like: "myhostname-ab12cd34._sharefile._tcp.local."
-            short = name.replace(f".{type_}", "").replace(type_, "")
-            # last segment after final "-" is the peer id
-            peer_id = short.rsplit("-", 1)[-1].strip(".")
-        except Exception:
-            return
-        with self._lock:
-            self.peers.pop(peer_id, None)
-
-    def update_service(self, zc, type_, name):
-        self.add_service(zc, type_, name)
-
-    def get_peers(self) -> dict:
-        with self._lock:
-            return dict(self.peers)
-
-    def stop(self):
-        if self._info:
-            self.zeroconf.unregister_service(self._info)
-        self.zeroconf.close()
-
-# ── pairing ───────────────────────────────────────────────────────────────────
-def generate_pair_code() -> str:
-    import random, string
-    return "".join(random.choices(string.digits, k=6))
-
-def pair_request_handler(conn: socket.socket, addr):
-    """Handle incoming pair requests."""
-    try:
-        data = conn.recv(4096).decode()
-        req  = json.loads(data)
-
-        if req.get("type") != "pair_request":
-            conn.close()
-            return
-
-        peer_hostname = req["hostname"]
-        peer_id       = req["id"]
-        code          = req["code"]
-
-        console.print(f"\n[bold yellow]  Pairing request from [cyan]{peer_hostname}[/cyan][/bold yellow]")
-        console.print(f"  Verification code: [bold green]{code}[/bold green]")
-        console.print("  Make sure this matches what they see on their screen.\n")
-
-        accept = Confirm.ask("  Accept pairing?", default=False)
-
-        if accept:
-            peers = load_peers()
-            peers[peer_id] = {
-                "hostname":  peer_hostname,
-                "id":        peer_id,
-                "paired_at": datetime.now().isoformat(),
-            }
-            save_peers(peers)
-            resp = {"type": "pair_accepted", "hostname": get_hostname(), "id": get_my_id()}
-            console.print(f"  [green]✓[/green] Paired with [cyan]{peer_hostname}[/cyan]")
-        else:
-            resp = {"type": "pair_rejected"}
-            console.print("  [yellow]Pairing declined.[/yellow]")
-
-        conn.send(json.dumps(resp).encode())
-    except Exception as e:
-        console.print(f"  [red]Pairing error: {e}[/red]")
-    finally:
-        conn.close()
-
-def start_pair_listener():
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", PAIR_PORT))
-    srv.listen(5)
-    srv.settimeout(1)
-    while True:
-        try:
-            conn, addr = srv.accept()
-            t = threading.Thread(target=pair_request_handler, args=(conn, addr), daemon=True)
-            t.start()
-        except socket.timeout:
-            continue
-        except OSError:
-            break
-
-def do_pair(peer_ip: str, peer_hostname: str):
-    """Initiate pairing with a peer."""
-    code = generate_pair_code()
-    console.print(f"\n  Pairing code: [bold green]{code}[/bold green]")
-    console.print("  Share this code verbally with the other person.\n")
-
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(30)
-        s.connect((peer_ip, PAIR_PORT))
-        req = {
-            "type":     "pair_request",
-            "hostname": get_hostname(),
-            "id":       get_my_id(),
-            "code":     code,
-        }
-        s.send(json.dumps(req).encode())
-        resp_data = s.recv(4096).decode()
-        resp = json.loads(resp_data)
-        s.close()
-
-        if resp.get("type") == "pair_accepted":
-            peer_id = resp["id"]
-            peers = load_peers()
-            peers[peer_id] = {
-                "hostname":  peer_hostname,
-                "id":        peer_id,
-                "paired_at": datetime.now().isoformat(),
-            }
-            save_peers(peers)
-            console.print(f"  [green]✓[/green] Successfully paired with [cyan]{peer_hostname}[/cyan]!")
-        else:
-            console.print("  [yellow]Pairing was declined.[/yellow]")
-    except ConnectionRefusedError:
-        console.print(f"  [red]Could not connect. Is {peer_hostname} running share?[/red]")
-    except socket.timeout:
-        console.print("  [red]Timed out waiting for response.[/red]")
-    except Exception as e:
-        console.print(f"  [red]Error: {e}[/red]")
-
-# ── file transfer ─────────────────────────────────────────────────────────────
-def recv_file_handler(conn: socket.socket, addr):
-    """Handle incoming file transfer."""
-    try:
-        # read header length (4 bytes)
-        raw_len = conn.recv(4)
-        if not raw_len:
-            return
-        header_len = struct.unpack(">I", raw_len)[0]
-        header_data = b""
-        while len(header_data) < header_len:
-            chunk = conn.recv(header_len - len(header_data))
-            if not chunk:
-                return
-            header_data += chunk
-
-        header    = json.loads(header_data.decode())
-        sender_id = header["sender_id"]
-        filename  = Path(header["filename"]).name   # strip any path traversal
-        filesize  = header["filesize"]
-        checksum  = header["checksum"]
-
-        # verify trust
-        peers = load_peers()
-        if sender_id not in peers:
-            conn.send(b"REJECT")
-            console.print(f"\n  [yellow]Rejected file from unknown sender ({addr[0]})[/yellow]")
-            return
-
-        sender_name = peers[sender_id]["hostname"]
-        conn.send(b"ACCEPT")
-
-        # receive file
-        dest = INBOX_DIR / filename
-        # avoid overwriting
-        if dest.exists():
-            stem    = dest.stem
-            suffix  = dest.suffix
-            counter = 1
-            while dest.exists():
-                dest = INBOX_DIR / f"{stem}_{counter}{suffix}"
-                counter += 1
-
-        received   = 0
-        sha256     = hashlib.sha256()
-
-        with open(dest, "wb") as f:
-            while received < filesize:
-                to_read = min(CHUNK_SIZE, filesize - received)
-                chunk   = conn.recv(to_read)
-                if not chunk:
-                    break
-                f.write(chunk)
-                sha256.update(chunk)
-                received += len(chunk)
-
-        # verify checksum
-        if sha256.hexdigest() == checksum:
-            conn.send(b"OK")
-            console.print(f"\n  [green]✓[/green] Received [cyan]{filename}[/cyan] from [cyan]{sender_name}[/cyan] → {dest}")
-        else:
-            conn.send(b"CORRUPT")
-            dest.unlink(missing_ok=True)
-            console.print(f"\n  [red]✗ Corrupted file from {sender_name}, discarded.[/red]")
-
-    except Exception as e:
-        console.print(f"\n  [red]Transfer error: {e}[/red]")
-    finally:
-        conn.close()
-
-def start_transfer_listener():
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", TRANSFER_PORT))
-    srv.listen(10)
-    srv.settimeout(1)
-    while True:
-        try:
-            conn, addr = srv.accept()
-            t = threading.Thread(target=recv_file_handler, args=(conn, addr), daemon=True)
-            t.start()
-        except socket.timeout:
-            continue
-        except OSError:
-            break
-
-def send_file(peer_ip: int, peer_port: int, filepath: Path) -> bool:
-    """Send a file to a peer."""
-    filesize = filepath.stat().st_size
-
-    # compute checksum
-    sha256 = hashlib.sha256()
-    with open(filepath, "rb") as f:
-        while chunk := f.read(CHUNK_SIZE):
-            sha256.update(chunk)
-    checksum = sha256.hexdigest()
-
-    header = json.dumps({
-        "sender_id": get_my_id(),
-        "filename":  filepath.name,
-        "filesize":  filesize,
-        "checksum":  checksum,
-    }).encode()
-
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(10)
-        s.connect((peer_ip, peer_port))
-
-        # send header
-        s.send(struct.pack(">I", len(header)))
-        s.send(header)
-
-        # wait for accept/reject
-        response = s.recv(6)
-        if response != b"ACCEPT":
-            console.print("  [red]Transfer rejected by peer (not paired?)[/red]")
-            s.close()
-            return False
-
-        s.settimeout(60)
-
-        # send file with progress bar
+        # Stream the file in chunks to handle large files without loading into RAM
         sent = 0
-        with Progress(
-            "[progress.description]{task.description}",
-            BarColumn(),
-            "[progress.percentage]{task.percentage:>3.0f}%",
-            TransferSpeedColumn(),
-            TimeRemainingColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task(f"  Sending [cyan]{filepath.name}[/cyan]", total=filesize)
-            with open(filepath, "rb") as f:
-                while chunk := f.read(CHUNK_SIZE):
-                    s.send(chunk)
-                    sent += len(chunk)
-                    progress.update(task, advance=len(chunk))
+        with path.open("rb") as f:
+            while chunk := f.read(CHUNK):
+                s.sendall(chunk)
+                sent += len(chunk)
+                _progress(sent, size)
 
-        # wait for confirmation
-        result = s.recv(8)
-        s.close()
+    print(f"\n✓ Sent.")
 
-        if result == b"OK":
-            return True
-        else:
-            console.print("  [red]File was corrupted in transit.[/red]")
-            return False
+def cmd_msg(text: str, peer_hint: str | None):
+    peers = load_peers()
+    name, ip = pick_peer(peers, peer_hint)
 
-    except ConnectionRefusedError:
-        console.print(f"  [red]Could not connect to peer. Are they online?[/red]")
-        return False
-    except Exception as e:
-        console.print(f"  [red]Send error: {e}[/red]")
-        return False
+    print(f"Sending message to {name} ({ip}) …")
 
-# ── daemon mode ───────────────────────────────────────────────────────────────
-def run_daemon():
-    """Run as background listener + advertise on network."""
-    console.print(f"\n  [bold]share[/bold] daemon running")
-    console.print(f"  Hostname : [cyan]{get_hostname()}[/cyan]")
-    console.print(f"  ID       : [cyan]{get_my_id()}[/cyan]")
-    console.print(f"  IP       : [cyan]{get_local_ip()}[/cyan]")
-    console.print(f"  Inbox    : [cyan]{INBOX_DIR}[/cyan]")
-    console.print("  Press Ctrl+C to stop.\n")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(TIMEOUT)
+        try:
+            s.connect((ip, PORT))
+        except (ConnectionRefusedError, TimeoutError):
+            die(f"Could not reach {name} ({ip}:{PORT}). Ask them to run: share recv")
 
-    # start listeners
-    t1 = threading.Thread(target=start_transfer_listener, daemon=True)
-    t2 = threading.Thread(target=start_pair_listener,    daemon=True)
-    t1.start()
-    t2.start()
+        send_header(s, {
+            "type": "message",
+            "from": my_name(),
+            "text": text,
+        })
 
-    # advertise on network
-    discovery = PeerDiscovery()
-    discovery.start_advertising()
+    print("✓ Sent.")
 
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        console.print("\n  [yellow]Stopping...[/yellow]")
-        discovery.stop()
+# ── Receive ───────────────────────────────────────────────────────────────────
 
-# ── interactive UI ─────────────────────────────────────────────────────────────
-def interactive_send():
-    """Discover peers and send a file interactively."""
-    console.print("\n  [bold]share[/bold] — scanning network...\n")
-
-    discovery = PeerDiscovery()
-    discovery.start_advertising()
-    discovery.start_browsing()
-
-    # give mDNS time to discover
-    with console.status("  Looking for peers..."):
-        time.sleep(2)
-
-    peers_online = discovery.get_peers()
-    trusted      = load_peers()
-
-    if not peers_online:
-        console.print("  [yellow]No peers found on the network.[/yellow]")
-        console.print("  Make sure they're running [bold]share --listen[/bold]\n")
-        discovery.stop()
-        return
-
-    # filter: show all online peers, mark trusted
-    choices = []
-    for pid, info in peers_online.items():
-        label = info["hostname"]
-        if pid in trusted:
-            label += " [paired]"
-        else:
-            label += " [not paired]"
-        choices.append(questionary.Choice(title=label, value=info))
-
-    peer = questionary.select(
-        "Select peer:",
-        choices=choices,
-        style=STYLE,
-    ).ask()
-
-    if not peer:
-        discovery.stop()
-        return
-
-    peer_id = peer["id"]
-    if peer_id not in trusted:
-        console.print(f"\n  [yellow]'{peer['hostname']}' is not paired yet.[/yellow]")
-        do_pair_now = questionary.confirm("  Pair now?", style=STYLE).ask()
-        if do_pair_now:
-            do_pair(peer["ip"], peer["hostname"])
-            # re-check
-            if peer_id not in load_peers():
-                discovery.stop()
-                return
-        else:
-            discovery.stop()
-            return
-
-    # pick file
-    file_path_str = questionary.path(
-        "File to send:",
-        style=STYLE,
-    ).ask()
-
-    if not file_path_str:
-        discovery.stop()
-        return
-
-    filepath = Path(file_path_str).expanduser()
-    if not filepath.exists() or not filepath.is_file():
-        console.print(f"  [red]File not found: {filepath}[/red]")
-        discovery.stop()
-        return
-
-    console.print()
-    ok = send_file(peer["ip"], peer["port"], filepath)
-    if ok:
-        console.print(f"\n  [green]✓[/green] [bold]{filepath.name}[/bold] sent to [cyan]{peer['hostname']}[/cyan]\n")
-    else:
-        console.print(f"\n  [red]✗ Failed to send {filepath.name}[/red]\n")
-
-    discovery.stop()
-
-def interactive_pair():
-    """Pair with a peer interactively."""
-    console.print("\n  [bold]share --pair[/bold] — scanning network...\n")
-
-    discovery = PeerDiscovery()
-    discovery.start_advertising()
-    discovery.start_browsing()
-
-    with console.status("  Looking for peers..."):
-        time.sleep(2)
-
-    peers_online = discovery.get_peers()
-    trusted      = load_peers()
-
-    if not peers_online:
-        console.print("  [yellow]No peers found.[/yellow]\n")
-        discovery.stop()
-        return
-
-    choices = []
-    for pid, info in peers_online.items():
-        label = info["hostname"]
-        if pid in trusted:
-            label += "  (already paired)"
-        choices.append(questionary.Choice(title=label, value=info))
-
-    peer = questionary.select(
-        "Select peer to pair with:",
-        choices=choices,
-        style=STYLE,
-    ).ask()
-
-    if peer:
-        do_pair(peer["ip"], peer["hostname"])
-
-    discovery.stop()
-
-def list_peers():
-    """Show trusted peers."""
+def cmd_recv():
+    """
+    Listen for exactly one incoming transfer, handle it, then exit.
+    We accept only connections whose source IP is in our peer whitelist.
+    """
     peers = load_peers()
     if not peers:
-        console.print("\n  No trusted peers yet. Run [bold]share --pair[/bold] to add one.\n")
+        die("No trusted peers yet. Run: share pair  first.")
+
+    trusted_ips = set(peers.values())
+    INBOX.mkdir(parents=True, exist_ok=True)
+
+    print(f"Waiting for one incoming transfer on port {PORT} …  (Ctrl-C to cancel)")
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("", PORT))
+        srv.listen(1)
+
+        # Keep trying until we get a trusted connection
+        while True:
+            conn, (src_ip, _) = srv.accept()
+            if src_ip in trusted_ips:
+                break
+            # Reject and log untrusted sources
+            conn.close()
+            print(f"  [ignored] Connection from untrusted IP {src_ip}")
+
+    with conn:
+        conn.settimeout(TIMEOUT)
+        header = recv_header(conn)
+
+        sender = header.get("from", src_ip)
+
+        if header["type"] == "message":
+            ts = datetime.now().strftime("%H:%M")
+            print(f"\n[{ts}] Message from {sender}:")
+            print(f"  {header['text']}\n")
+
+        elif header["type"] == "file":
+            filename = Path(header["filename"]).name  # strip any path component for safety
+            dest     = _unique_path(INBOX / filename)
+            size     = header["size"]
+
+            print(f"Receiving '{filename}' ({_fmt_size(size)}) from {sender} …")
+
+            received = 0
+            with dest.open("wb") as f:
+                while received < size:
+                    chunk = conn.recv(min(CHUNK, size - received))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    received += len(chunk)
+                    _progress(received, size)
+
+            print(f"\n✓ Saved to {dest}")
+
+        else:
+            print(f"Unknown transfer type '{header['type']}' — ignored.")
+
+# ── Peers list ────────────────────────────────────────────────────────────────
+
+def cmd_peers():
+    peers = load_peers()
+    if not peers:
+        print("No trusted peers. Run: share pair <ip>")
         return
+    print("Trusted peers:")
+    for name, ip in peers.items():
+        print(f"  {name:<20} {ip}")
 
-    table = Table(title="Trusted Peers", border_style="bright_black", header_style="bold cyan")
-    table.add_column("Hostname",  style="cyan")
-    table.add_column("ID",        style="dim")
-    table.add_column("Paired At", style="dim")
+# ── Utilities ─────────────────────────────────────────────────────────────────
 
-    for pid, info in peers.items():
-        table.add_row(info["hostname"], info["id"], info.get("paired_at", "—"))
+def die(msg: str):
+    print(f"Error: {msg}", file=sys.stderr)
+    sys.exit(1)
 
-    console.print()
-    console.print(table)
-    console.print()
+def _fmt_size(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
 
-# ── entrypoint ────────────────────────────────────────────────────────────────
+def _progress(done: int, total: int):
+    if total == 0:
+        return
+    pct  = done / total * 100
+    bar  = "#" * int(pct / 2)
+    print(f"\r  [{bar:<50}] {pct:5.1f}%", end="", flush=True)
+
+def _unique_path(p: Path) -> Path:
+    """If a file already exists at p, append a counter to avoid overwriting."""
+    if not p.exists():
+        return p
+    stem, suffix = p.stem, p.suffix
+    i = 1
+    while True:
+        candidate = p.with_name(f"{stem}_{i}{suffix}")
+        if not candidate.exists():
+            return candidate
+        i += 1
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
 def main():
-    setup_dirs()
-
     parser = argparse.ArgumentParser(
         prog="share",
-        description="Simple peer-to-peer file transfer CLI",
+        description="Minimal local-network file & message sharing.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-examples:
-  share               discover peers and send a file interactively
-  share --listen      run as listener/daemon (required on receiver side)
-  share --pair        pair with a new peer
-  share --peers       list trusted peers
-        """
+Examples:
+  share pair --listen          # machine A waits
+  share pair 192.168.1.10      # machine B connects → both are now paired
+
+  share recv                   # machine A waits for one transfer
+  share send photo.jpg         # machine B sends (auto-picks the only peer)
+  share msg "dinner at 7?"     # machine B sends a message
+
+  share peers                  # see who you've paired with
+""",
     )
-    parser.add_argument("--listen", "-l", action="store_true", help="run as background daemon")
-    parser.add_argument("--pair",   "-p", action="store_true", help="pair with a new peer")
-    parser.add_argument("--peers",        action="store_true", help="list trusted peers")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # pair
+    p_pair = sub.add_parser("pair", help="Pair with a new peer")
+    p_pair.add_argument("ip", nargs="?", help="IP address of peer (omit to listen)")
+    p_pair.add_argument("--listen", action="store_true", help="Wait for peer to connect")
+
+    # send
+    p_send = sub.add_parser("send", help="Send a file")
+    p_send.add_argument("file")
+    p_send.add_argument("peer", nargs="?", help="Peer name (optional if only one peer)")
+
+    # msg
+    p_msg = sub.add_parser("msg", help="Send a short text message")
+    p_msg.add_argument("text")
+    p_msg.add_argument("peer", nargs="?")
+
+    # recv
+    sub.add_parser("recv", help="Receive one incoming transfer")
+
+    # peers
+    sub.add_parser("peers", help="List trusted peers")
+
     args = parser.parse_args()
 
-    if args.listen:
-        run_daemon()
-    elif args.pair:
-        interactive_pair()
-    elif args.peers:
-        list_peers()
-    else:
-        interactive_send()
+    if args.cmd == "pair":
+        if args.listen or not args.ip:
+            cmd_pair_listen()
+        else:
+            cmd_pair_connect(args.ip)
+    elif args.cmd == "send":
+        cmd_send(args.file, args.peer)
+    elif args.cmd == "msg":
+        cmd_msg(args.text, args.peer)
+    elif args.cmd == "recv":
+        cmd_recv()
+    elif args.cmd == "peers":
+        cmd_peers()
 
 if __name__ == "__main__":
     main()
