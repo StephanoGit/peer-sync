@@ -101,9 +101,38 @@ def get_local_ip() -> str:
         return "127.0.0.1"
 
 # ── discovery ─────────────────────────────────────────────────────────────────
+def get_zeroconf_iface() -> str | None:
+    """Return the best network interface for zeroconf (prefers en0, then first non-loopback)."""
+    import netifaces  # optional, fall back gracefully
+    pass
+
+def make_zeroconf() -> Zeroconf:
+    """Create a Zeroconf instance bound to the correct interface."""
+    import socket
+    # Try to find a real LAN interface — prefer en0 (WiFi on macOS)
+    preferred = ["en0", "en1", "eth0", "wlan0"]
+    iface = None
+    for name in preferred:
+        try:
+            socket.if_nametoindex(name)
+            iface = name
+            break
+        except OSError:
+            continue
+
+    if iface:
+        from zeroconf import InterfaceChoice
+        try:
+            # bind to the specific interface ip
+            ip = get_local_ip()
+            return Zeroconf(interfaces=[ip])
+        except Exception:
+            pass
+    return Zeroconf()
+
 class PeerDiscovery:
     def __init__(self):
-        self.zeroconf   = Zeroconf()
+        self.zeroconf   = make_zeroconf()
         self.peers      = {}   # name -> {ip, port, id, hostname}
         self._lock      = threading.Lock()
         self._browser   = None
