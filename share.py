@@ -148,10 +148,17 @@ class PeerDiscovery:
             }
 
     def remove_service(self, zc, type_, name):
-        info = zc.get_service_info(type_, name)
-        if not info:
+        # Don't call get_service_info here — the service is already gone
+        # and zeroconf may be shutting down, causing NotRunningException.
+        # The service name is formatted as "{hostname}-{id}._sharefile._tcp.local."
+        # so we extract the id from the name string directly.
+        try:
+            # name looks like: "myhostname-ab12cd34._sharefile._tcp.local."
+            short = name.replace(f".{type_}", "").replace(type_, "")
+            # last segment after final "-" is the peer id
+            peer_id = short.rsplit("-", 1)[-1].strip(".")
+        except Exception:
             return
-        peer_id = info.properties.get(b"id", b"").decode()
         with self._lock:
             self.peers.pop(peer_id, None)
 

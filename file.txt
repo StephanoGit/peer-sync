@@ -1,0 +1,38 @@
+Exception in thread zeroconf-ServiceBrowser-_sharefile._tcp-13283553:
+Traceback (most recent call last):
+  File "/opt/homebrew/Cellar/python@3.14/3.14.0_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/threading.py", line 1081, in _bootstrap_inner
+    self._context.run(self.run)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "src/zeroconf/_services/browser.py", line 805, in zeroconf._services.browser.ServiceBrowser.run
+  File "src/zeroconf/_services/browser.py", line 724, in zeroconf._services.browser._ServiceBrowserBase._fire_service_state_changed_event
+  File "src/zeroconf/_services/browser.py", line 734, in zeroconf._services.browser._ServiceBrowserBase._fire_service_state_changed_event
+  File "src/zeroconf/_services/__init__.py", line 58, in zeroconf._services.Signal.fire
+  File "src/zeroconf/_services/browser.py", line 300, in zeroconf._services.browser._on_change_dispatcher
+  File "/Users/velicuvlad/.local/bin/share", line 151, in remove_service
+    info = zc.get_service_info(type_, name)
+  File "/Users/velicuvlad/Documents/Git/peer-sync/venv/lib/python3.14/site-packages/zeroconf/_core.py", line 290, in get_service_info
+    if info.request(self, timeout, question_type):
+       ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "src/zeroconf/_services/info.py", line 804, in zeroconf._services.info.ServiceInfo.request
+  File "/Users/velicuvlad/Documents/Git/peer-sync/venv/lib/python3.14/site-packages/zeroconf/_utils/asyncio.py", line 117, in run_coro_with_timeout
+    return asyncio.run_coroutine_threadsafe(aw, loop).result(
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        millis_to_seconds(timeout) + _LOADED_SYSTEM_TIMEOUT
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.0_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/_base.py", line 450, in result
+    return self.__get_result()
+           ~~~~~~~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.0_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/concurrent/futures/_base.py", line 395, in __get_result
+    raise self._exception
+  File "src/zeroconf/_services/info.py", line 842, in async_request
+  File "/Users/velicuvlad/Documents/Git/peer-sync/venv/lib/python3.14/site-packages/zeroconf/_core.py", line 246, in async_wait_for_start
+    raise NotRunningException
+zeroconf._exceptions.NotRunningException
+ ~/Doc/G/peer-sync main > ipconfig | grep "inet " | grep -v 127.0.0.1
+usage: ipconfig <command> <args>
+where <command> is one of waitall, getifaddr, ifcount, getoption, getiflist, getsummary, getpacket, getv6packet, getra, getdhcpduid, getdhcpiaid, set, setverbose
+ ~/Doc/G/peer-sync main > ifconfig | grep "inet " | grep -v 127.0.0.1
+	inet 192.168.0.201 netmask 0xffffff00 broadcast 192.168.0.255
+ ~/Doc/G/peer-sync main >
