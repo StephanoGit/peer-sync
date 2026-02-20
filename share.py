@@ -8,38 +8,41 @@ Usage:
   share pair <ip>              Initiate pairing with a peer at <ip>
   share send <file> [peer]     Send a file to a peer
   share msg  <text> [peer]     Send a short message to a peer
-  share recv                   Wait for ONE incoming transfer, then exit
+  share daemon start           Start background listener (auto-receives everything)
+  share daemon stop            Stop the background listener
+  share daemon status          Check if the daemon is running
   share peers                  List all trusted peers
 
 Design philosophy
 ─────────────────
-• No daemon / background process.
-  The receiver manually runs `share recv` when they want to accept something.
-  This avoids systemd/launchd complexity and keeps the tool auditable.
+• Optional self-backgrounding daemon.
+  `share daemon start` forks the process into the background using os.fork()
+  (POSIX only — works on macOS and Linux, not Windows).
+  It writes its PID to ~/.config/share/daemon.pid so it can be stopped later.
+  Logs go to ~/.config/share/daemon.log.
 
 • Whitelist-only.
-  You must explicitly pair before any transfer is accepted.
-  Peers are stored in ~/.config/share/peers.json.
+  The daemon only accepts connections from IPs that are in peers.json.
+  Everything else is silently dropped. You must pair first.
 
 • Fixed TCP port (PORT constant below).
-  mDNS/zeroconf discovery was deliberately left out to avoid dependencies.
-  You identify peers by the name you give them at pairing time; their IP is
-  remembered. If a peer's IP changes (DHCP), just re-pair.
+  No mDNS/zeroconf to keep dependencies at zero.
+  Peers are identified by name; their IP is stored at pairing time.
 
 • One-shot connections.
-  Each send/recv opens a socket, does its work, and closes.
-  No keep-alive, no multiplexing — easier to reason about.
+  Each transfer opens a socket, does its work, and closes.
+  The daemon loops back to accept() immediately after.
 
 • Simple wire protocol.
   [4 bytes: big-endian length of header JSON]
   [N bytes: UTF-8 JSON header]
   [remaining bytes: raw file payload (empty for messages)]
-  The header carries type, sender name, filename, and file size.
 """
 
 import argparse
 import json
 import os
+import signal
 import socket
 import struct
 import sys
@@ -48,16 +51,17 @@ from datetime import datetime
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-PORT        = 57890          # arbitrary unprivileged port; change if it collides
-INBOX       = Path.home() / "ShareInbox"
-CONFIG_DIR  = Path.home() / ".config" / "share"
-PEERS_FILE  = CONFIG_DIR / "peers.json"
-CHUNK       = 65536          # bytes to read/write per loop iteration
-TIMEOUT     = 10             # socket timeout in seconds
+PORT       = 57890
+INBOX      = Path.home() / "ShareInbox"
+CONFIG_DIR = Path.home() / ".config" / "share"
+PEERS_FILE = CONFIG_DIR / "peers.json"
+PID_FILE   = CONFIG_DIR / "daemon.pid"
+LOG_FILE   = CONFIG_DIR / "daemon.log"
+CHUNK      = 65536   # bytes per read/write iteration
+TIMEOUT    = 10      # socket timeout in seconds
 
 # ── Peer store ────────────────────────────────────────────────────────────────
-# Peers are stored as { "alice": "192.168.1.42", ... }
-# We use a plain dict serialised to JSON — no database needed at this scale.
+# Stored as { "alice": "192.168.1.42", ... } in a plain JSON file.
 
 def load_peers() -> dict:
     if PEERS_FILE.exists():
@@ -82,7 +86,6 @@ def pick_peer(peers: dict, hint: str | None) -> tuple[str, str]:
         name, ip = next(iter(peers.items()))
         return name, ip
 
-    # Multiple peers — let the user choose
     print("Multiple peers available:")
     names = list(peers)
     for i, n in enumerate(names, 1):
@@ -108,7 +111,7 @@ def recv_header(sock: socket.socket) -> dict:
     return json.loads(_recv_exactly(sock, length))
 
 def _recv_exactly(sock: socket.socket, n: int) -> bytes:
-    """Read exactly n bytes from the socket, raising on short read."""
+    """Read exactly n bytes; raise on short read (connection dropped)."""
     buf = b""
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
@@ -118,24 +121,18 @@ def _recv_exactly(sock: socket.socket, n: int) -> bytes:
     return buf
 
 def my_name() -> str:
-    """Use the machine hostname as our identity (good enough for LAN use)."""
+    """Use hostname as our identity — simple and requires nothing extra."""
     return socket.gethostname()
 
 # ── Pairing ───────────────────────────────────────────────────────────────────
-# Pairing is a two-step mutual exchange:
-#   1. Both sides send their name.
-#   2. Both sides receive the other's name.
-#   3. Each side saves (name -> ip) in its peer store.
-#
-# No crypto / certificates — this is a trust-on-first-use model for a LAN.
-# If you need security, put it on a VPN or add TLS later.
+# Trust-on-first-use: both sides exchange hostnames over a raw TCP connection.
+# No crypto — use a VPN if you need that on an untrusted network.
 
 def cmd_pair_listen():
     """Wait for a peer to connect, exchange names, save them."""
     print(f"Waiting for a peer to connect on port {PORT} …  (Ctrl-C to cancel)")
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
-        # SO_REUSEADDR lets us restart quickly without waiting for TIME_WAIT
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("", PORT))
         srv.listen(1)
@@ -143,14 +140,13 @@ def cmd_pair_listen():
 
     with conn:
         conn.settimeout(TIMEOUT)
-        # Exchange names — initiator sends first, listener responds
-        peer_name_raw = _recv_exactly(conn, 256).rstrip(b"\x00").decode()
+        peer_name = _recv_exactly(conn, 256).rstrip(b"\x00").decode()
         conn.sendall(my_name().encode().ljust(256, b"\x00"))
 
     peers = load_peers()
-    peers[peer_name_raw] = peer_ip
+    peers[peer_name] = peer_ip
     save_peers(peers)
-    print(f"✓ Paired with '{peer_name_raw}' ({peer_ip}). They can now send you files.")
+    print(f"✓ Paired with '{peer_name}' ({peer_ip}).")
 
 def cmd_pair_connect(ip: str):
     """Connect to a listening peer, exchange names, save them."""
@@ -160,16 +156,16 @@ def cmd_pair_connect(ip: str):
         s.settimeout(TIMEOUT)
         try:
             s.connect((ip, PORT))
-        except (ConnectionRefusedError, TimeoutError):
-            die(f"Could not connect to {ip}:{PORT}. Make sure the other side runs: share pair --listen")
+        except (ConnectionRefusedError, TimeoutError, OSError) as e:
+            die(f"Could not connect to {ip}:{PORT} — {e}\nMake sure the other side runs: share pair --listen")
 
         s.sendall(my_name().encode().ljust(256, b"\x00"))
-        peer_name_raw = _recv_exactly(s, 256).rstrip(b"\x00").decode()
+        peer_name = _recv_exactly(s, 256).rstrip(b"\x00").decode()
 
     peers = load_peers()
-    peers[peer_name_raw] = ip
+    peers[peer_name] = ip
     save_peers(peers)
-    print(f"✓ Paired with '{peer_name_raw}' ({ip}). You can now send them files.")
+    print(f"✓ Paired with '{peer_name}' ({ip}).")
 
 # ── Send ──────────────────────────────────────────────────────────────────────
 
@@ -180,7 +176,6 @@ def cmd_send(filepath: str, peer_hint: str | None):
 
     peers = load_peers()
     name, ip = pick_peer(peers, peer_hint)
-
     size = path.stat().st_size
     print(f"Sending '{path.name}' ({_fmt_size(size)}) to {name} ({ip}) …")
 
@@ -188,10 +183,9 @@ def cmd_send(filepath: str, peer_hint: str | None):
         s.settimeout(TIMEOUT)
         try:
             s.connect((ip, PORT))
-        except (ConnectionRefusedError, TimeoutError):
-            die(f"Could not reach {name} ({ip}:{PORT}). Ask them to run: share recv")
+        except (ConnectionRefusedError, TimeoutError, OSError) as e:
+            die(f"Could not reach {name} ({ip}:{PORT}) — {e}\nIs their daemon running? share daemon status")
 
-        # Send header first so the receiver knows what's coming
         send_header(s, {
             "type":     "file",
             "from":     my_name(),
@@ -199,7 +193,6 @@ def cmd_send(filepath: str, peer_hint: str | None):
             "size":     size,
         })
 
-        # Stream the file in chunks to handle large files without loading into RAM
         sent = 0
         with path.open("rb") as f:
             while chunk := f.read(CHUNK):
@@ -212,86 +205,169 @@ def cmd_send(filepath: str, peer_hint: str | None):
 def cmd_msg(text: str, peer_hint: str | None):
     peers = load_peers()
     name, ip = pick_peer(peers, peer_hint)
-
     print(f"Sending message to {name} ({ip}) …")
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(TIMEOUT)
         try:
             s.connect((ip, PORT))
-        except (ConnectionRefusedError, TimeoutError):
-            die(f"Could not reach {name} ({ip}:{PORT}). Ask them to run: share recv")
+        except (ConnectionRefusedError, TimeoutError, OSError) as e:
+            die(f"Could not reach {name} ({ip}:{PORT}) — {e}")
 
-        send_header(s, {
-            "type": "message",
-            "from": my_name(),
-            "text": text,
-        })
+        send_header(s, {"type": "message", "from": my_name(), "text": text})
 
     print("✓ Sent.")
 
-# ── Receive ───────────────────────────────────────────────────────────────────
+# ── Transfer handler (used by daemon loop) ────────────────────────────────────
 
-def cmd_recv():
-    """
-    Listen for exactly one incoming transfer, handle it, then exit.
-    We accept only connections whose source IP is in our peer whitelist.
-    """
+def handle_transfer(conn: socket.socket, src_ip: str):
+    """Process one incoming connection: save file or print message."""
+    conn.settimeout(TIMEOUT)
+    header = recv_header(conn)
+    sender = header.get("from", src_ip)
+    ts     = _ts()
+
+    if header["type"] == "message":
+        print(f"[{ts}] Message from {sender}: {header['text']}", flush=True)
+
+    elif header["type"] == "file":
+        INBOX.mkdir(parents=True, exist_ok=True)
+        filename = Path(header["filename"]).name  # strip any path prefix for safety
+        dest     = _unique_path(INBOX / filename)
+        size     = header["size"]
+
+        print(f"[{ts}] Receiving '{filename}' ({_fmt_size(size)}) from {sender} …", flush=True)
+
+        received = 0
+        with dest.open("wb") as f:
+            while received < size:
+                chunk = conn.recv(min(CHUNK, size - received))
+                if not chunk:
+                    break
+                f.write(chunk)
+                received += len(chunk)
+
+        print(f"[{ts}] Saved to {dest}", flush=True)
+
+    else:
+        print(f"[{ts}] Unknown type '{header['type']}' from {src_ip} — ignored.", flush=True)
+
+# ── Daemon ────────────────────────────────────────────────────────────────────
+# How forking works here:
+#   1. os.fork() splits the process. Parent gets child PID; child gets 0.
+#   2. Parent saves child PID to daemon.pid, prints a message, exits.
+#      The shell gets control back immediately — feels like a normal command.
+#   3. Child calls os.setsid() → becomes session leader with no controlling
+#      terminal, so it won't be killed when the terminal closes.
+#   4. Child replaces stdin/stdout/stderr with /dev/null and the log file.
+#   5. Child enters _daemon_loop() which accepts connections forever.
+
+def cmd_daemon_start():
+    if _daemon_pid() is not None:
+        print("Daemon is already running. Use: share daemon status")
+        return
+
     peers = load_peers()
     if not peers:
-        die("No trusted peers yet. Run: share pair  first.")
+        die("No trusted peers yet — pair first so the daemon knows who to accept.")
 
-    trusted_ips = set(peers.values())
-    INBOX.mkdir(parents=True, exist_ok=True)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-    print(f"Waiting for one incoming transfer on port {PORT} …  (Ctrl-C to cancel)")
+    pid = os.fork()
+
+    if pid > 0:
+        # ── Parent: save PID and return to shell ──
+        PID_FILE.write_text(str(pid))
+        print(f"✓ Daemon started (PID {pid}).")
+        print(f"  Files will appear in: {INBOX}/")
+        print(f"  Logs at:              {LOG_FILE}")
+        return
+
+    # ── Child: detach and loop ──
+    os.setsid()
+
+    devnull = open(os.devnull, "rb")
+    logfile = open(LOG_FILE, "a")
+    os.dup2(devnull.fileno(), sys.stdin.fileno())
+    os.dup2(logfile.fileno(), sys.stdout.fileno())
+    os.dup2(logfile.fileno(), sys.stderr.fileno())
+
+    _daemon_loop()
+
+def _daemon_loop():
+    """
+    Runs in the forked child forever.
+    Opens one server socket and handles incoming transfers in sequence.
+    Peers are reloaded on every connection so new pairings take effect
+    without restarting the daemon.
+    """
+    print(f"[{_ts()}] Daemon started on port {PORT}", flush=True)
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("", PORT))
-        srv.listen(1)
+        srv.listen(5)
 
-        # Keep trying until we get a trusted connection
         while True:
-            conn, (src_ip, _) = srv.accept()
-            if src_ip in trusted_ips:
-                break
-            # Reject and log untrusted sources
-            conn.close()
-            print(f"  [ignored] Connection from untrusted IP {src_ip}")
+            try:
+                conn, (src_ip, _) = srv.accept()
+            except OSError:
+                break  # socket closed, likely by SIGTERM
 
-    with conn:
-        conn.settimeout(TIMEOUT)
-        header = recv_header(conn)
+            # Reload whitelist every time — picks up pairs made after daemon started
+            trusted_ips = set(load_peers().values())
 
-        sender = header.get("from", src_ip)
+            if src_ip not in trusted_ips:
+                print(f"[{_ts()}] Rejected connection from untrusted {src_ip}", flush=True)
+                conn.close()
+                continue
 
-        if header["type"] == "message":
-            ts = datetime.now().strftime("%H:%M")
-            print(f"\n[{ts}] Message from {sender}:")
-            print(f"  {header['text']}\n")
+            try:
+                with conn:
+                    handle_transfer(conn, src_ip)
+            except Exception as e:
+                print(f"[{_ts()}] Error from {src_ip}: {e}", flush=True)
 
-        elif header["type"] == "file":
-            filename = Path(header["filename"]).name  # strip any path component for safety
-            dest     = _unique_path(INBOX / filename)
-            size     = header["size"]
+    print(f"[{_ts()}] Daemon stopped.", flush=True)
 
-            print(f"Receiving '{filename}' ({_fmt_size(size)}) from {sender} …")
+def cmd_daemon_stop():
+    pid = _daemon_pid()
+    if pid is None:
+        print("Daemon is not running.")
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+        PID_FILE.unlink(missing_ok=True)
+        print(f"✓ Daemon (PID {pid}) stopped.")
+    except ProcessLookupError:
+        PID_FILE.unlink(missing_ok=True)
+        print("Daemon was not running (stale PID file cleaned up).")
 
-            received = 0
-            with dest.open("wb") as f:
-                while received < size:
-                    chunk = conn.recv(min(CHUNK, size - received))
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    received += len(chunk)
-                    _progress(received, size)
+def cmd_daemon_status():
+    pid = _daemon_pid()
+    if pid is None:
+        print("Daemon is NOT running.")
+        return
+    try:
+        os.kill(pid, 0)   # signal 0 = "does this process exist?" — sends nothing
+        print(f"Daemon is running (PID {pid}).")
+        print(f"  Log:   {LOG_FILE}")
+        print(f"  Inbox: {INBOX}/")
+    except ProcessLookupError:
+        PID_FILE.unlink(missing_ok=True)
+        print("Daemon is NOT running (stale PID file cleaned up).")
 
-            print(f"\n✓ Saved to {dest}")
+def _daemon_pid() -> int | None:
+    """Return the PID from daemon.pid, or None if it doesn't exist."""
+    if PID_FILE.exists():
+        try:
+            return int(PID_FILE.read_text().strip())
+        except ValueError:
+            return None
+    return None
 
-        else:
-            print(f"Unknown transfer type '{header['type']}' — ignored.")
+def _ts() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 # ── Peers list ────────────────────────────────────────────────────────────────
 
@@ -320,12 +396,12 @@ def _fmt_size(n: int) -> str:
 def _progress(done: int, total: int):
     if total == 0:
         return
-    pct  = done / total * 100
-    bar  = "#" * int(pct / 2)
+    pct = done / total * 100
+    bar = "#" * int(pct / 2)
     print(f"\r  [{bar:<50}] {pct:5.1f}%", end="", flush=True)
 
 def _unique_path(p: Path) -> Path:
-    """If a file already exists at p, append a counter to avoid overwriting."""
+    """Append a counter if the file already exists, to avoid overwriting."""
     if not p.exists():
         return p
     stem, suffix = p.stem, p.suffix
@@ -345,37 +421,40 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # One-time pairing
   share pair --listen          # machine A waits
-  share pair 192.168.1.10      # machine B connects → both are now paired
+  share pair 192.168.1.10      # machine B connects
 
-  share recv                   # machine A waits for one transfer
-  share send photo.jpg         # machine B sends (auto-picks the only peer)
-  share msg "dinner at 7?"     # machine B sends a message
+  # Start always-on background receiver (once per machine)
+  share daemon start
+  share daemon status
+  share daemon stop
 
-  share peers                  # see who you've paired with
+  # Send any time — no action needed on the receiving side
+  share send photo.jpg
+  share send report.pdf alice  # specify peer if you have more than one
+  share msg "dinner at 7?"
+
+  share peers
 """,
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    # pair
     p_pair = sub.add_parser("pair", help="Pair with a new peer")
-    p_pair.add_argument("ip", nargs="?", help="IP address of peer (omit to listen)")
+    p_pair.add_argument("ip", nargs="?", help="IP of peer to connect to")
     p_pair.add_argument("--listen", action="store_true", help="Wait for peer to connect")
 
-    # send
     p_send = sub.add_parser("send", help="Send a file")
     p_send.add_argument("file")
     p_send.add_argument("peer", nargs="?", help="Peer name (optional if only one peer)")
 
-    # msg
-    p_msg = sub.add_parser("msg", help="Send a short text message")
+    p_msg = sub.add_parser("msg", help="Send a short message")
     p_msg.add_argument("text")
     p_msg.add_argument("peer", nargs="?")
 
-    # recv
-    sub.add_parser("recv", help="Receive one incoming transfer")
+    p_daemon = sub.add_parser("daemon", help="Manage the background receiver")
+    p_daemon.add_argument("action", choices=["start", "stop", "status"])
 
-    # peers
     sub.add_parser("peers", help="List trusted peers")
 
     args = parser.parse_args()
@@ -389,8 +468,13 @@ Examples:
         cmd_send(args.file, args.peer)
     elif args.cmd == "msg":
         cmd_msg(args.text, args.peer)
-    elif args.cmd == "recv":
-        cmd_recv()
+    elif args.cmd == "daemon":
+        if args.action == "start":
+            cmd_daemon_start()
+        elif args.action == "stop":
+            cmd_daemon_stop()
+        elif args.action == "status":
+            cmd_daemon_status()
     elif args.cmd == "peers":
         cmd_peers()
 
