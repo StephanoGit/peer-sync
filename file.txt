@@ -1,2 +1,14 @@
+# Pairing
+# Machine A                        Machine B
+share pair --listen                 share pair 192.168.1.42
+
+# Sending 
+share recv                          # receiver runs this manually
+share send report.pdf               # sender pushes the file
+share msg "check your inbox"
+
+ipconfig getifaddr en0 
+ip route get 1 | awk '{print $7; exit}'
+
 chmod +x share.py
 cp share.py ~/.local/bin/share
