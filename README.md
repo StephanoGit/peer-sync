@@ -134,7 +134,26 @@ share msg "hello from A" alice
 
 When there are multiple peers and you omit the peer name, `share` will show a numbered list and ask which peer to send to.
 
-### 7. Stopping the daemon
+### 7. Discovering potential peers on your LAN
+
+You can scan your local `A.B.C.*` subnet for hosts that have the `share` port open:
+
+```bash
+share scan
+```
+
+Example output:
+
+```text
+Scanning 192.168.1.1-254 on port 57890 …
+Hosts with the share port open:
+  192.168.1.23  (this machine)
+  192.168.1.42
+```
+
+This is a best-effort check: it only reports that the TCP port is open, not that the host is trusted. Use `share pair <ip>` once to add a host to your trusted peers list.
+
+### 8. Stopping the daemon
 
 On any machine:
 
@@ -144,7 +163,7 @@ share daemon stop
 
 If the PID file is stale (process already gone), the tool cleans it up and reports that the daemon is not running.
 
-### 8. Trusted peers list
+### 9. Trusted peers list
 
 To see all trusted peers:
 
