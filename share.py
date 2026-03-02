@@ -46,6 +46,7 @@ import signal
 import socket
 import struct
 import sys
+import threading
 from pathlib import Path
 from datetime import datetime
 
@@ -58,7 +59,7 @@ PEERS_FILE = CONFIG_DIR / "peers.json"
 PID_FILE   = CONFIG_DIR / "daemon.pid"
 LOG_FILE   = CONFIG_DIR / "daemon.log"
 CHUNK      = 65536   # bytes per read/write iteration
-TIMEOUT    = 10      # socket timeout in seconds
+TIMEOUT    = 60      # socket timeout in seconds (higher for large files / slower LANs)
 
 # ── Peer store ────────────────────────────────────────────────────────────────
 # Stored as { "alice": "192.168.1.42", ... } in a plain JSON file.
@@ -72,7 +73,7 @@ def save_peers(peers: dict):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     PEERS_FILE.write_text(json.dumps(peers, indent=2))
 
-def pick_peer(peers: dict, hint: str | None) -> tuple[str, str]:
+def pick_peer(peers, hint):
     """Return (name, ip) for the chosen peer, or exit with an error."""
     if not peers:
         die("No trusted peers yet. Run: share pair <ip>")
@@ -130,7 +131,18 @@ def my_name() -> str:
 
 def cmd_pair_listen():
     """Wait for a peer to connect, exchange names, save them."""
+    # Try to guess a useful local IP for the user to share.
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as tmp:
+            # We never actually send anything, this just lets the OS pick
+            # the outbound interface so we can read its IP.
+            tmp.connect(("8.8.8.8", 80))
+            local_ip = tmp.getsockname()[0]
+    except OSError:
+        local_ip = "unknown"
+
     print(f"Waiting for a peer to connect on port {PORT} …  (Ctrl-C to cancel)")
+    print(f"Give them this IP: {local_ip}")
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -169,7 +181,7 @@ def cmd_pair_connect(ip: str):
 
 # ── Send ──────────────────────────────────────────────────────────────────────
 
-def cmd_send(filepath: str, peer_hint: str | None):
+def cmd_send(filepath, peer_hint):
     path = Path(filepath)
     if not path.exists():
         die(f"File not found: {filepath}")
@@ -202,7 +214,7 @@ def cmd_send(filepath: str, peer_hint: str | None):
 
     print(f"\n✓ Sent.")
 
-def cmd_msg(text: str, peer_hint: str | None):
+def cmd_msg(text, peer_hint):
     peers = load_peers()
     name, ip = pick_peer(peers, peer_hint)
     print(f"Sending message to {name} ({ip}) …")
@@ -297,11 +309,28 @@ def cmd_daemon_start():
 def _daemon_loop():
     """
     Runs in the forked child forever.
-    Opens one server socket and handles incoming transfers in sequence.
+    Opens one server socket and handles incoming transfers.
     Peers are reloaded on every connection so new pairings take effect
     without restarting the daemon.
+    Each connection is handled in a lightweight background thread so that
+    a slow or stalled sender doesn't block new incoming transfers.
     """
     print(f"[{_ts()}] Daemon started on port {PORT}", flush=True)
+
+    def _handle_client(conn: socket.socket, src_ip: str):
+        # Each client runs in its own thread.
+        try:
+            # Reload whitelist for every connection — picks up new peers dynamically.
+            trusted_ips = set(load_peers().values())
+            if src_ip not in trusted_ips:
+                print(f"[{_ts()}] Rejected connection from untrusted {src_ip}", flush=True)
+                conn.close()
+                return
+
+            with conn:
+                handle_transfer(conn, src_ip)
+        except Exception as e:
+            print(f"[{_ts()}] Error from {src_ip}: {e}", flush=True)
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -314,19 +343,8 @@ def _daemon_loop():
             except OSError:
                 break  # socket closed, likely by SIGTERM
 
-            # Reload whitelist every time — picks up pairs made after daemon started
-            trusted_ips = set(load_peers().values())
-
-            if src_ip not in trusted_ips:
-                print(f"[{_ts()}] Rejected connection from untrusted {src_ip}", flush=True)
-                conn.close()
-                continue
-
-            try:
-                with conn:
-                    handle_transfer(conn, src_ip)
-            except Exception as e:
-                print(f"[{_ts()}] Error from {src_ip}: {e}", flush=True)
+            t = threading.Thread(target=_handle_client, args=(conn, src_ip), daemon=True)
+            t.start()
 
     print(f"[{_ts()}] Daemon stopped.", flush=True)
 
@@ -357,7 +375,7 @@ def cmd_daemon_status():
         PID_FILE.unlink(missing_ok=True)
         print("Daemon is NOT running (stale PID file cleaned up).")
 
-def _daemon_pid() -> int | None:
+def _daemon_pid():
     """Return the PID from daemon.pid, or None if it doesn't exist."""
     if PID_FILE.exists():
         try:
@@ -379,6 +397,15 @@ def cmd_peers():
     print("Trusted peers:")
     for name, ip in peers.items():
         print(f"  {name:<20} {ip}")
+
+
+def cmd_inbox():
+    """
+    Show the current inbox folder used for received files and ensure it exists.
+    This gives users a simple, discoverable way to find the shared folder.
+    """
+    INBOX.mkdir(parents=True, exist_ok=True)
+    print(f"Inbox folder: {INBOX}")
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 
@@ -457,6 +484,8 @@ Examples:
 
     sub.add_parser("peers", help="List trusted peers")
 
+    sub.add_parser("inbox", help="Show the shared inbox folder for received files")
+
     args = parser.parse_args()
 
     if args.cmd == "pair":
@@ -477,6 +506,8 @@ Examples:
             cmd_daemon_status()
     elif args.cmd == "peers":
         cmd_peers()
+    elif args.cmd == "inbox":
+        cmd_inbox()
 
 if __name__ == "__main__":
     main()
